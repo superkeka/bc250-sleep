@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=BC-250 sleep: what this boot can do
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/bc250-sleep/bc250-sleep boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

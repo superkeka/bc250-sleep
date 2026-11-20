@@ -1,0 +1,114 @@
+name: Build bc250-sleep
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Check scripts
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          version=$(cat VERSION)
+          plugin=$(jq -r .version decky-plugin/package.json)
+          # The plugin offers an update when the package it carries is newer than the installed one.
+          if [ "$version" != "$plugin" ]; then
+            echo "VERSION is $version, decky-plugin/package.json is $plugin"
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Shell syntax
+        shell: bash
+        run: |
+          for f in bc250-sleep bc250-poweroff bc250-update install.sh tools/*.sh decky-plugin/build.sh; do
+            bash -n "$f"
+          done
+
+      - name: Python syntax
+        shell: bash
+        run: python3 -m py_compile tools/*.py decky-plugin/main.py
+
+  decky:
+    name: Build the Decky plugin
+    needs: check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build and package
+        shell: bash
+        run: |
+          out=$(decky-plugin/build.sh)
+          (cd "$(dirname "decky-plugin/$out")" && zip -qr "$GITHUB_WORKSPACE/bc250-sleep-Decky.zip" bc250-sleep)
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: bc250-sleep-Decky
+          path: bc250-sleep-Decky.zip
+
+  release:
+    name: Release bc250-sleep
+    if: >-
+      github.event_name == 'push' &&
+      github.repository_owner == 'superkeka'
+    needs: [check, decky]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: v${{ needs.check.outputs.version }}
+      VERSION: ${{ needs.check.outputs.version }}
+
+    steps:
+      - name: Download Decky plugin
+        uses: actions/download-artifact@v4
+        with:
+          name: bc250-sleep-Decky
+          path: artifacts
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # One release per VERSION: a push that does not raise it publishes nothing.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$TAG is out already"
+            exit 0
+          fi
+          cp artifacts/bc250-sleep-Decky.zip "bc250-sleep-$VERSION-Decky.zip"
+          gh release create "$TAG" "bc250-sleep-$VERSION-Decky.zip" \
+            --generate-notes \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "bc250-sleep $VERSION"

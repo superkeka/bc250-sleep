@@ -1,0 +1,202 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Keeps bc250-sleep fit for the running system. A system update brings a kernel the modules built for the old
+# one do not load on, and on SteamOS takes the compiler and the kernel's build files with it. This installs
+# those when they are missing (pacman: the exact build files of the running kernel; Bazzite: a container with
+# the compiler, the build files are in its image), builds the modules for the running kernel, and puts the S3
+# table back when the boot no longer has it (system.sh says how, per system). bc250-sleep-update.service runs
+# it at every boot, once the network is up.
+#
+#   bc250-update                 whatever of the above is missing; then the boot check again if anything changed
+#   bc250-update check           says what is missing (exit 1 when anything is); changes nothing
+#   bc250-update tools           installs the compiler and the kernel's build files, if missing
+#   bc250-update build [--force] builds the modules that are not built for the running kernel, with what is
+#                                installed (no network); --force builds both again
+#   bc250-update acpi add|remove the S3 table into or out of the boot (install.sh)
+set -u
+DIR=/etc/bc250-sleep
+VAR=/var/lib/bc250-sleep
+RUN=/run/bc250-sleep
+LOG=$VAR/update.log
+mkdir -p "$VAR" "$RUN"
+# shellcheck source=tools/system.sh
+. "$DIR/system.sh"
+
+log() {
+	echo "$(date '+%F %T') $*" >> "$LOG" 2> /dev/null
+	echo "$*"
+}
+# What the panel and "bc250-sleep status" show about the modules.
+state() {
+	echo "$*" > "$RUN/modules"
+}
+# A module file built for the running kernel.
+built() {
+	[ -f "$1" ] && [ "$(modinfo -F vermagic "$1" 2> /dev/null | cut -d' ' -f1)" = "$KVER" ]
+}
+modules_built() {
+	built "$DIR/src/bc250_pm.ko" && built "$DIR/gfxcsb/gfxcsb.ko"
+}
+
+tools() {
+	local why
+	sys_tools_missing > /dev/null && return 0
+	state "installing the compiler and the build files of $KVER"
+	log "installing the compiler and the build files of $KVER (missing: $(sys_tools_missing))"
+	why=$(sys_tools)
+	if [ $? != 0 ] || ! sys_tools_missing > /dev/null; then
+		[ -z "$why" ] || log "$why"
+		log "the compiler or the build files of $KVER could not be installed (missing: $(sys_tools_missing)); see $LOG"
+		return 1
+	fi
+	log "installed the compiler and the build files of $KVER"
+}
+
+# One module, in its folder under $DIR, from nothing.
+make_module() {
+	mkdir -p "$DIR/tmp"
+	TMPDIR=$DIR/tmp sys_make -C "$KBUILD" M="$DIR/$1" clean > /dev/null 2>&1
+	TMPDIR=$DIR/tmp SYS_TIMEOUT=300 sys_make -C "$KBUILD" M="$DIR/$1" modules > "$2" 2>&1
+	sys_label "$DIR/$1/"*.ko
+}
+build() {
+	local miss
+	if [ "${1:-}" != --force ] && modules_built; then
+		state "ready for $KVER"
+		return 0
+	fi
+	if ! miss=$(sys_tools_missing); then
+		log "the modules cannot be built for $KVER: missing $miss"
+		state "not built for $KVER: missing $miss"
+		return 1
+	fi
+	state "building for $KVER"
+	if [ "${1:-}" = --force ] || ! built "$DIR/src/bc250_pm.ko"; then
+		log "building bc250_pm for $KVER"
+		if ! make_module src "$DIR/build.log" || ! built "$DIR/src/bc250_pm.ko"; then
+			tail -20 "$DIR/build.log" >> "$LOG"
+			log "bc250_pm did not build for $KVER; see $DIR/build.log"
+			state "not built for $KVER: bc250_pm did not build"
+			return 1
+		fi
+	fi
+	if [ "${1:-}" = --force ] || ! built "$DIR/gfxcsb/gfxcsb.ko"; then
+		log "building gfxcsb for $KVER"
+		if ! make_module gfxcsb "$DIR/build-gfxcsb.log" || ! built "$DIR/gfxcsb/gfxcsb.ko"; then
+			log "gfxcsb did not build for $KVER: a sleep will close the display session; see $DIR/build-gfxcsb.log"
+			state "only bc250_pm for $KVER: gfxcsb did not build"
+			return 0
+		fi
+	fi
+	state "ready for $KVER"
+}
+
+# The S3 table, into the boot or out of it. Returns 0 when it changed something, 1 when there was nothing to
+# change, 2 when it failed.
+acpi() {
+	local why
+	if sys_acpi_configured; then
+		[ "$1" = add ] && return 1
+	elif [ "$1" = remove ]; then
+		return 1
+	fi
+	why=$(sys_acpi "$1") || { log "the S3 table could not be ${1}ed: $why"; return 2; }
+	[ -z "$why" ] || log "$why"
+	return 0
+}
+# After an update: the table back into the boot, or SteamOS's boot loader configuration made again when the
+# archive has the table and this boot still offers no S3. Either counts from the next reboot.
+acpi_heal() {
+	grep -q deep /sys/power/mem_sleep && return 1
+	if ! sys_acpi_configured; then
+		acpi add && log "the S3 table was not in the boot: put back, counts from the next reboot" && return 0
+	elif [ "$(sys_acpi_method)" = steamos ] && [ -e "$ACPI_GRUBCFG" ] && ! [ -e "$RUN/grub-made" ]; then
+		sys_rw
+		sys_grub_update
+		sys_ro
+		touch "$RUN/grub-made"
+		log "the S3 table is in the archive but this boot has no S3: the boot loader's configuration made again, counts from the next reboot"
+		return 0
+	fi
+	return 1
+}
+
+check() {
+	local rc=0 miss
+	if modules_built; then
+		echo "modules: built for $KVER"
+	else
+		echo "modules: not built for $KVER"
+		rc=1
+	fi
+	echo "system: $SYS (kernel arguments: $(sys_karg_method), S3 table: $(sys_acpi_method))"
+	if miss=$(sys_tools_missing); then
+		echo "build tools: installed"
+	else
+		echo "build tools: missing $miss"
+	fi
+	if grep -q deep /sys/power/mem_sleep; then
+		echo "S3 table: in this boot"
+	elif sys_acpi_configured; then
+		echo "S3 table: configured, not in this boot (counts from the next reboot)"
+	else
+		echo "S3 table: missing"
+		rc=1
+	fi
+	return $rc
+}
+
+[ "${1:-}" = check ] && { check; exit; }
+[ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+# One at a time: the boot's run and one started from the panel.
+exec 9> "$RUN/update.lock"
+flock 9
+
+case "${1:-}" in
+tools)
+	tools
+	;;
+build)
+	build "${2:-}"
+	;;
+acpi)
+	case "${2:-}" in
+	add | remove)
+		acpi "$2"
+		rc=$?
+		[ "$rc" = 2 ] && exit 1
+		[ "$rc" = 0 ] && echo "changed: counts from the next reboot"
+		exit 0
+		;;
+	*)
+		echo "usage: bc250-update acpi add|remove"
+		exit 1
+		;;
+	esac
+	;;
+"")
+	changed=""
+	rc=0
+	if ! modules_built; then
+		if ! tools; then
+			rc=1
+			state "not built for $KVER: the compiler or the build files could not be installed"
+		elif build; then
+			changed=1
+		else
+			rc=1
+		fi
+	else
+		state "ready for $KVER"
+	fi
+	acpi_heal
+	# A boot check that ran without the modules runs again with them (without the lock: it may build).
+	exec 9>&-
+	[ -z "$changed" ] || "$DIR/bc250-sleep" boot
+	exit $rc
+	;;
+*)
+	echo "usage: bc250-update [check | tools | build [--force] | acpi add|remove]"
+	exit 1
+	;;
+esac

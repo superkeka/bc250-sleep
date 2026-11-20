@@ -1,0 +1,600 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Sleep for the AMD BC-250. systemd-suspend.service runs this in place of systemd-sleep, so the "Sleep"
+# entry of Steam's power menu ends up here.
+#
+#   bc250-sleep                  sleep now; returns after the wake-up, with the session as it was
+#   bc250-sleep boot             once per boot: checks what a sleep needs and notes what this boot can do
+#   bc250-sleep status           says which sleep the button takes and what this boot can do
+#   bc250-sleep mode [hibernate|s3] shows or sets which sleep the button takes
+#   bc250-sleep shutdown [default|wake]     shows or sets the power-off: "wake" goes through the hibernation
+#                                path without an image to come back to, so a USB device such as the gamepad
+#                                can switch the board on again (bc250-poweroff)
+#
+# Two sleeps, chosen by the file "mode" next to this script (BC250_SLEEP_MODE in the environment wins):
+#   hibernate  the running system goes to the swap file and the board powers off: 5-6 W at
+#              the plug, about a minute down and twenty seconds up. On a board with the 8-core unlock all
+#              eight cores are there after it, because the firmware takes its ordinary start.
+#   s3         (the default) ACPI S3: under a second down, about five up, 10 W. Cores unlocked beyond the firmware's six
+#              stay off until the next reboot.
+# What cannot be done in this boot is replaced: the hibernation by the S3 sleep, and that by no sleep at all.
+#
+# For tests: a number of seconds in /run/bc250-sleep/alarm sets the clock to wake the board once (the file is
+# used up).
+#
+# The board cannot sleep out of the box; README.md says why each step below is there. In short: the
+# southbridge forgets its interrupt routing in a sleep, which the helper module puts back; unlocked cores
+# do not survive a sleep and are switched off first; and the GPU driver, which on this kind
+# of chip submits the gfx block's clear state only once, is made to submit it again on the way back
+# (module gfxcsb). With that the driver stays on the card, and the display session, Steam and a running
+# game go through the sleep as they are.
+#
+# If that module cannot be used on the running kernel, the old way is taken instead: the display session is
+# closed and the driver taken off the card before the sleep, and both are started again after it.
+#
+# If anything a sleep needs is missing, the board does not sleep: a sleep that cannot work is never entered,
+# because a failed wake-up needs the power plug.
+set -u
+DIR=/etc/bc250-sleep
+VAR=/var/lib/bc250-sleep
+RUN=/run/bc250-sleep
+LOG=$VAR/sleep.log
+POWEROFF_DROPIN=/etc/systemd/system/systemd-poweroff.service.d/bc250-sleep.conf
+CARD=0000:01:00.0
+AUDIO=0000:01:00.1
+
+# Settings of this board, in $DIR/config (see config.example):
+#   BC250_USER             the user of the display session; "auto": the one on seat0, else the first user
+#   BC250_SPARE_CPUS       threads of cores the firmware does not start after S3 (the 8-core unlock);
+#                          "auto": 6 7 14 15 when 16 threads are online, none otherwise
+#   BC250_STOP_UNITS       system services that talk to the card, stopped when the driver has to come off it
+#   BC250_STOP_USER_UNITS  the same among the user's services
+#   BC250_RESTART_UNITS    system services restarted after every wake-up, when they are enabled
+BC250_USER=auto
+BC250_SPARE_CPUS=auto
+BC250_STOP_UNITS="cyan-skillfish-governor-smu.service bc250-cu-live-manager.service bc250-smu-oc.service coolercontrold.service"
+BC250_STOP_USER_UNITS=""
+BC250_RESTART_UNITS="bc250-cu-live-manager.service"
+# shellcheck source=/dev/null
+[ -r "$DIR/config" ] && . "$DIR/config"
+# shellcheck source=tools/system.sh
+. "$DIR/system.sh"
+[ "$BC250_USER" != auto ] || BC250_USER=$(sys_user)
+# The display session: SDDM on SteamOS and Bazzite, whatever display-manager.service names elsewhere.
+DM=display-manager.service
+HOMEDIR=$(getent passwd "$BC250_USER" | cut -d: -f6)
+USER_ID=$(id -u "$BC250_USER" 2> /dev/null || echo 1000)
+if [ "$BC250_SPARE_CPUS" = auto ]; then
+	if [ "$(nproc --all)" = 16 ]; then SPARE="6 7 14 15"; else SPARE=""; fi
+else
+	SPARE=$BC250_SPARE_CPUS
+fi
+
+# The helper module for an S3 sleep: the southbridge put back, the wake event for USB, a watchdog on the way
+# back.
+MODULE_ARGS="fch=1 gpe=11"
+# The watchdog is stopped through /dev/watchdog (the kernel's sp5100_tco driver): without that, none.
+[ -e /dev/watchdog ] && MODULE_ARGS="$MODULE_ARGS rwdt=240"
+# For a hibernation the module does one thing: it enables the wake event the southbridge raises for USB.
+HIB_MODULE_ARGS="gpe=11"
+REG=$HOMEDIR/.steam/registry.vdf
+REGSAVE=$VAR/registry.vdf
+PARAM=/sys/module/bc250_pm/parameters
+
+mkdir -p "$VAR" "$RUN"
+log() {
+	echo "$(date '+%F %T') $*" >> "$LOG" 2> /dev/null
+	echo "bc250-sleep: $*" > /dev/kmsg 2> /dev/null
+}
+shutdown_mode() {
+	if [ -e "$POWEROFF_DROPIN" ]; then echo wake; else echo default; fi
+}
+mode() {
+	case "${BC250_SLEEP_MODE:-$(cat "$DIR/mode" 2> /dev/null)}" in
+	# "fast" (S3 with all cores after it) is gone since 1.2.
+	hibernate) echo hibernate ;;
+	*) echo s3 ;;
+	esac
+}
+
+load_module() {
+	grep -q '^bc250_pm ' /proc/modules && return 0
+	# shellcheck disable=SC2086
+	insmod "$DIR/src/bc250_pm.ko" $MODULE_ARGS 2>> "$LOG" && return 0
+	# A kernel update leaves a module built for the old kernel behind. Built here with what is installed;
+	# bc250-update installs what is missing once the network is up, and runs this check again.
+	"$DIR/bc250-update" build >> "$LOG" 2>&1 || return 1
+	# shellcheck disable=SC2086
+	insmod "$DIR/src/bc250_pm.ko" $MODULE_ARGS 2>> "$LOG"
+}
+
+# The module that makes the driver submit the gfx clear state again after a sleep. The place of the driver's
+# flag is read out of the driver's code for this kernel; without it the module is not loaded.
+load_gfxcsb() {
+	local off
+	grep -q '^gfxcsb ' /proc/modules && return 0
+	[ -e "$RUN/clear-state-always" ] && return 0
+	off=$("$DIR/gfxcsb-offset.sh" 2>> "$LOG")
+	[ -n "$off" ] || { log "the driver's code for $(uname -r) does not have the flag where it is looked for"; return 1; }
+	# This driver submits the clear state on every start: kept through a sleep without the module.
+	if [ "$off" = none ]; then
+		touch "$RUN/clear-state-always"
+		return 0
+	fi
+	if ! insmod "$DIR/gfxcsb/gfxcsb.ko" "off=$off" clear=0 2>> "$LOG"; then
+		"$DIR/bc250-update" build >> "$LOG" 2>&1 || return 1
+		insmod "$DIR/gfxcsb/gfxcsb.ko" "off=$off" clear=0 2>> "$LOG" || return 1
+	fi
+	# With the driver on the card the flag reads 0 or 1; anything else, and the place is wrong.
+	case "$(cat /sys/module/gfxcsb/parameters/flag 2> /dev/null)" in
+	0 | 1) echo 1 > /sys/module/gfxcsb/parameters/clear ;;
+	*)
+		log "the flag does not read as a flag ($(cat /sys/module/gfxcsb/parameters/flag 2> /dev/null)): module taken out"
+		rmmod gfxcsb 2> /dev/null
+		return 1
+		;;
+	esac
+}
+
+# What only a reboot can change is looked at once per boot.
+boot_check() {
+	local why="" hwhy="" out
+	rm -f "$RUN/ready" "$RUN/keep" "$RUN/hib" "$RUN/why" "$RUN/hibwhy"
+	if [ "$(cat /sys/class/dmi/id/board_name 2> /dev/null)" != "AMD BC-250" ]; then
+		why="$why; this is not an AMD BC-250"
+		hwhy="$hwhy; this is not an AMD BC-250"
+	fi
+	grep -q deep /sys/power/mem_sleep || why="$why; this boot's ACPI tables offer no S3"
+	# With cores that do not come back the disk's queues need one polled queue (nvme-param.sh).
+	if [ -n "$SPARE" ] && ! grep -qw 'nvme.poll_queues=1' /proc/cmdline; then
+		why="$why; kernel parameter nvme.poll_queues=1 is missing (nvme-param.sh add, then a reboot)"
+	fi
+	# The BIOS option the firmware needs to come back from S3: "CPU DC BTC" on, at 690 mV (AmdSetup bytes
+	# 0x6f6-0x6f8; at its default, Auto, a wake-up hangs in the firmware). The firmware reads it when it boots,
+	# and a power cut of some seconds puts the BIOS defaults back: if it is not set now, this boot cannot sleep.
+	# Written in this boot already ($RUN/bios-written, gone with the reboot): a second check must not take it as set.
+	out=$(python3 "$DIR/setvar.py" 2>&1)
+	if ! { echo "$out" | grep -q '0x6f6 = 0x01' && echo "$out" | grep -q '0x6f7 = 0xb2' && echo "$out" | grep -q '0x6f8 = 0x02'; } &&
+		[ "$(cat /sys/class/dmi/id/bios_version 2> /dev/null)" != P3.00 ]; then
+		# The bytes are where BIOS P3.00 has the option; on another BIOS they may hold something else.
+		why="$why; the BIOS option for S3 is known on P3.00-based BIOSes only, this is $(cat /sys/class/dmi/id/bios_version 2> /dev/null)"
+	elif [ -e "$RUN/bios-written" ]; then
+		why="$why; the BIOS option for S3 was written in this boot (counts from the next reboot)"
+	elif ! { echo "$out" | grep -q '0x6f6 = 0x01' && echo "$out" | grep -q '0x6f7 = 0xb2' && echo "$out" | grep -q '0x6f8 = 0x02'; }; then
+		python3 "$DIR/setvar.py" 0x6f6=1 0x6f7=0xb2 0x6f8=2 >> "$LOG" 2>&1
+		touch "$RUN/bios-written"
+		why="$why; the BIOS option for S3 was not set (written now, counts from the next reboot)"
+	fi
+	if ! load_module; then
+		why="$why; the helper module does not load on $(uname -r)"
+		hwhy="$hwhy; the helper module does not load on $(uname -r)"
+	fi
+	# The driver can stay on the card through a sleep only with this module; a hibernation has no other way.
+	if load_gfxcsb; then
+		touch "$RUN/keep"
+	else
+		hwhy="$hwhy; the GPU driver cannot be kept through a sleep on $(uname -r)"
+	fi
+	grep -qw disk /sys/power/state || hwhy="$hwhy; this kernel offers no hibernation"
+	if [ -z "$hwhy" ]; then
+		touch "$RUN/hib"
+		log "boot: this boot can hibernate"
+	else
+		echo "${hwhy#; }" > "$RUN/hibwhy"
+		log "boot: no hibernation in this boot: ${hwhy#; }"
+	fi
+	if [ -z "$why" ]; then
+		touch "$RUN/ready"
+		if [ -e "$RUN/keep" ]; then
+			log "boot: this boot can sleep in S3, the driver stays on the card"
+		else
+			log "boot: this boot can sleep in S3 the old way (session closed, driver off the card)"
+		fi
+	else
+		echo "${why#; }" > "$RUN/why"
+		log "boot: no S3 sleep in this boot: ${why#; }"
+	fi
+}
+
+case "${1:-}" in
+boot)
+	boot_check
+	exit 0
+	;;
+status)
+	echo "the Sleep button: $(mode)"
+	echo "power-off: $(shutdown_mode)"
+	echo "modules: $(cat "$RUN/modules" 2> /dev/null || "$DIR/bc250-update" check | sed -n 's/^modules: //p')"
+	if [ -e "$RUN/hib" ]; then echo "hibernation: ready, the session and all cores come back"
+	else echo "hibernation: off: $(cat "$RUN/hibwhy" 2> /dev/null || echo 'the boot check has not run')"
+	fi
+	if [ -e "$RUN/ready" ]; then
+		if [ -e "$RUN/keep" ]; then echo "S3 sleep: ready, the session goes through it"; else echo "S3 sleep: ready, the old way (the session is closed for it)"; fi
+	else echo "S3 sleep: off: $(cat "$RUN/why" 2> /dev/null || echo 'the boot check has not run')"
+	fi
+	exit 0
+	;;
+mode)
+	case "${2:-}" in
+	hibernate | s3)
+		{ echo "$2" > "$DIR/mode.new" && mv -f "$DIR/mode.new" "$DIR/mode"; } 2> /dev/null || { echo "run with sudo"; exit 1; }
+		;;
+	"") ;;
+	*)
+		echo "usage: bc250-sleep mode [hibernate|s3]"
+		exit 1
+		;;
+	esac
+	mode
+	exit 0
+	;;
+shutdown)
+	case "${2:-}" in
+	wake)
+		install -D -m 644 "$DIR/systemd-poweroff.conf" "$POWEROFF_DROPIN" 2> /dev/null || { echo "run with sudo"; exit 1; }
+		systemctl daemon-reload
+		;;
+	default)
+		rm -f "$POWEROFF_DROPIN" 2> /dev/null || { echo "run with sudo"; exit 1; }
+		systemctl daemon-reload
+		;;
+	"") ;;
+	*)
+		echo "usage: bc250-sleep shutdown [default|wake]"
+		exit 1
+		;;
+	esac
+	shutdown_mode
+	exit 0
+	;;
+"") ;;
+*)
+	echo "usage: bc250-sleep [boot | status | mode [hibernate|s3] | shutdown [default|wake]]"
+	exit 1
+	;;
+esac
+
+no_sleep() {
+	log "no sleep: $1"
+	exit 1
+}
+exec 9> "$RUN/lock"
+flock -n 9 || { log "a sleep is already under way"; exit 1; }
+
+# Processes that hold the card open, apart from the init system and the login manager, which hand its
+# device files to the session.
+holders() {
+	local p
+	for p in /proc/[0-9]*; do
+		case "$(cat "$p/comm" 2> /dev/null)" in systemd | systemd-logind) continue ;; esac
+		ls -l "$p/fd" 2> /dev/null | grep -qE '/dev/dri/|/dev/kfd' && echo "${p#/proc/}"
+	done
+}
+steam_running() {
+	pgrep -f '[u]buntu12_32/steam|[s]teamrt64/steam|[s]teamrt32/steam' > /dev/null
+}
+# One thread of every disk queue off and on: after a sleep the block layer can leave queues marked
+# inactive although their threads are online, and reads from those threads then hang for ever.
+disk_fix() {
+	local h c
+	for h in /sys/block/nvme0n1/mq/*; do
+		for c in $(tr ',' ' ' < "$h/cpu_list"); do
+			[ "$c" = 0 ] && continue
+			[ "$(cat "/sys/devices/system/cpu/cpu$c/online" 2> /dev/null)" = 1 ] || continue
+			echo 0 > "/sys/devices/system/cpu/cpu$c/online" 2> /dev/null
+			echo 1 > "/sys/devices/system/cpu/cpu$c/online" 2> /dev/null
+			break
+		done
+	done
+}
+# Without this the first change of the display clock's divider after a sleep is not applied, and the 4K
+# picture is a flat green: the register with the dividers is written again with the value it has.
+kick() {
+	echo 1 > $PARAM/kick 2>> "$LOG" && sleep 0.5
+}
+# Puts the driver on the card and brings the session back. Used after the wake-up, and to back out when
+# the way into the sleep fails half way.
+bring_back() {
+	local r
+	if [ ! -e "/sys/bus/pci/devices/$CARD/driver" ]; then
+		# After a sleep the table that tells the driver which blocks the chip has is gone from the
+		# card's memory: the driver takes the copy saved before the sleep.
+		OLDPATH=$(cat /sys/module/firmware_class/parameters/path)
+		OLDDISC=$(cat $PARAM/discovery 2> /dev/null)
+		printf '%s' "$VAR/fw" > /sys/module/firmware_class/parameters/path
+		echo 2 > $PARAM/discovery 2>> "$LOG"
+		if timeout 120 sh -c "echo $CARD > /sys/bus/pci/drivers/amdgpu/bind" 2>> "$LOG"; then r=done; else r=FAILED; fi
+		printf '%s' "$OLDPATH" > /sys/module/firmware_class/parameters/path
+		[ -z "$OLDDISC" ] || echo "$OLDDISC" > $PARAM/discovery 2>> "$LOG"
+		log "driver put back on the card: $r"
+		[ "$r" = done ] && kick
+	fi
+	[ -e "/sys/bus/pci/devices/$AUDIO/driver" ] || echo "$AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>> "$LOG"
+	# shellcheck disable=SC2086
+	[ -z "$STOPPED" ] || systemctl start --no-block $STOPPED 2>> "$LOG"
+	# shellcheck disable=SC2086
+	[ -z "$USER_STOPPED" ] || systemctl --user -M "$BC250_USER@" start --no-block $USER_STOPPED 2>> "$LOG"
+	systemctl start $DM 2>> "$LOG"
+}
+
+# What may wake the board: every USB controller and device (the helper module enables the event the
+# southbridge really raises for them).
+usb_wake() {
+	local d w
+	for d in /sys/bus/pci/devices/*; do
+		case "$(cat "$d/class" 2> /dev/null)" in
+		0x0c03*) echo enabled > "$d/power/wakeup" 2> /dev/null ;;
+		esac
+	done
+	for w in /sys/bus/usb/devices/*/power/wakeup; do
+		echo enabled > "$w" 2> /dev/null
+	done
+}
+# The compositor's own switch for the screen: 1 turns the output off, 0 on again.
+screen_sleep() {
+	local env=/run/user/$USER_ID/gamescope-environment
+	[ -r "$env" ] || return 1
+	# shellcheck disable=SC2016
+	timeout 5 runuser -u "$BC250_USER" -- /bin/bash -c 'set -a; . "$1"; set +a; gamescopectl drm_sleep_external_screen "$2"' _ "$env" "$1" >> "$LOG" 2>&1
+}
+# True when the driver is on the card and the module that keeps it there sees its flag.
+driver_kept() {
+	[ -e "$RUN/keep" ] && [ -e "/sys/bus/pci/devices/$CARD/driver" ] || return 1
+	[ -e "$RUN/clear-state-always" ] && return 0
+	case "$(cat /sys/module/gfxcsb/parameters/flag 2> /dev/null)" in
+	0 | 1) return 0 ;;
+	esac
+	return 1
+}
+# Services that redo after a wake-up what the sleep undid (BC250_RESTART_UNITS), when they are enabled.
+restart_units() {
+	local u
+	for u in $BC250_RESTART_UNITS; do
+		systemctl is-enabled -q "$u" 2> /dev/null && systemctl restart --no-block "$u" 2>> "$LOG"
+	done
+}
+# The kernel's lines since the mark this script left in its log.
+since_mark() {
+	dmesg | awk '/bc250-sleep: mark for the kernel log/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }'
+}
+# The driver comes back from a sleep with its gfx ring tested. Without that ring it cannot draw, and taking
+# it off the card in that state stops the board: a reboot is what is left.
+driver_check() {
+	since_mark | grep -q 'IB test failed\|ring .* test failed' || return 0
+	log "the driver did not come back from the sleep (ring test failed): rebooting"
+	sync
+	systemctl reboot
+	exit 1
+}
+
+# The hibernation. Returns 0 after a round trip, 1 when the board never left (the caller then takes the S3
+# sleep). The image is written by systemd's own helper, which also leaves the note for the next start
+# about where the image is.
+hibernate_sleep() {
+	local t0 t1 rc alarm size
+	t0=$(date +%s)
+	log "== hibernation requested, threads $(cat /sys/devices/system/cpu/online), $(awk '/^MemAvailable|^Cached:|^AnonPages/ { printf "%s %d MiB ", $1, $2 / 1024 }' /proc/meminfo)"
+	# The picture goes first: the image takes most of a minute to write, with a still frame on the screen.
+	screen_sleep 1 || log "the screen was not switched off"
+	usb_wake
+	# After a start from the image the HPET may read all ones; taken for the clock, it stops the time.
+	echo hpet > /sys/devices/system/clocksource/clocksource0/unbind_clocksource 2> /dev/null
+	rmmod bc250_pm 2>> "$LOG"
+	# shellcheck disable=SC2086
+	if ! insmod "$DIR/src/bc250_pm.ko" $HIB_MODULE_ARGS 2>> "$LOG"; then
+		log "the helper module did not load for the hibernation"
+		load_module
+		screen_sleep 0
+		return 1
+	fi
+	echo 0 > /sys/class/rtc/rtc0/wakealarm 2> /dev/null
+	if [ -s "$RUN/alarm" ]; then
+		alarm=$(tr -cd '0-9' < "$RUN/alarm")
+		rm -f "$RUN/alarm"
+		[ -z "$alarm" ] || { rtcwake -m no -s "$alarm" > /dev/null 2>&1 && log "test alarm in $alarm s"; }
+	fi
+	# The image holds every page in use. The file cache is most of that on an idle system and can be read
+	# again from the disk, so it is dropped: less to write on the way down and to read on the way up. What
+	# programs hold stays in memory as far as it fits (the kernel's own limit is about half of the memory):
+	# nothing is pushed out to swap that does not have to be.
+	sync
+	echo 3 > /proc/sys/vm/drop_caches 2> /dev/null
+	# With a game in memory the image is as large as it may be, and the display driver, which moves the
+	# video memory to ordinary memory only when the devices are frozen, finds nothing left: such a
+	# hibernation fails after about a minute ("evicting device resources failed") and the S3 sleep is taken.
+	size=$(cat /sys/power/image_size 2> /dev/null)
+	awk '/^MemTotal:/ { print $2 * 1024 }' /proc/meminfo > /sys/power/image_size 2> /dev/null
+	echo "bc250-sleep: mark for the kernel log" > /dev/kmsg
+	sync
+	t1=$(date +%s)
+	log "hibernating after $((t1 - t0)) s of preparation, $(awk '/^Cached:|^AnonPages|^Shmem:/ { printf "%s %d MiB ", $1, $2 / 1024 }' /proc/meminfo)"
+	sync
+	/usr/lib/systemd/systemd-sleep hibernate >> "$LOG" 2>&1
+	rc=$?
+	[ -z "$size" ] || echo "$size" > /sys/power/image_size 2> /dev/null
+
+	# ---- back from the image, or never left ----
+	rmmod bc250_pm 2>> "$LOG"
+	load_module || log "the helper module did not load again"
+	since_mark | grep -E 'PM: (hibernation|Image)|Freezing|bc250-sleep|page allocation failure|evicting device resources|failed to freeze|Not enough free' | grep -v 'Marking nosave' | cut -c1-160 >> "$LOG"
+	if [ "$rc" != 0 ]; then
+		log "the hibernation did not happen (systemd-sleep returned $rc)"
+		screen_sleep 0
+		return 1
+	fi
+	# The same two steps as after an S3 sleep: the display clock's divider, and the services.
+	kick
+	restart_units
+	driver_check
+	screen_sleep 0 || log "the screen was not switched on"
+	sleep 1
+	kick
+	log "done: back from the hibernation $(($(date +%s) - t1)) s after it began, session $(systemctl is-active $DM), threads $(cat /sys/devices/system/cpu/online)"
+	return 0
+}
+
+# Unlocked cores left offline by an S3 sleep earlier in this boot.
+spare_offline() {
+	local c
+	for c in $SPARE; do
+		[ "$(cat "/sys/devices/system/cpu/cpu$c/online" 2> /dev/null)" = 0 ] && return 0
+	done
+	return 1
+}
+WANT=$(mode)
+if [ "$WANT" = hibernate ]; then
+	if [ ! -e "$RUN/hib" ]; then
+		log "no hibernation in this boot ($(cat "$RUN/hibwhy" 2> /dev/null || echo 'the boot check has not run')): taking the S3 sleep"
+	elif spare_offline; then
+		# Seen once: the hibernation hung right after its start, the board never powered off.
+		log "the unlocked cores are offline after an S3 sleep in this boot, and a hibernation from there hung: taking the S3 sleep"
+	elif ! driver_kept; then
+		log "the driver is not on the card or its flag is not seen: taking the S3 sleep"
+	elif ! awk 'NR > 1 && $1 !~ /zram/ { found = 1 } END { exit !found }' /proc/swaps; then
+		log "no swap file for the image: taking the S3 sleep"
+	else
+		hibernate_sleep && exit 0
+		log "taking the S3 sleep instead"
+	fi
+fi
+
+[ -e "$RUN/ready" ] || no_sleep "$(cat "$RUN/why" 2> /dev/null || echo 'the boot check has not run')"
+load_module || no_sleep "the helper module does not load"
+
+# The driver stays on the card when the module for it is in place and says the flag is one.
+KEEP=0
+driver_kept && KEEP=1
+log "== sleep requested ($([ "$KEEP" = 1 ] && echo 'the driver stays on the card' || echo 'the old way')), threads $(cat /sys/devices/system/cpu/online)"
+T0=$(date +%s)
+STOPPED=""
+USER_STOPPED=""
+if [ "$KEEP" = 0 ]; then
+	# Read as the user: the file lies in the user's home, where a link could point anywhere.
+	if runuser -u "$BC250_USER" -- cat "$REG" > "$REGSAVE.new" 2> /dev/null && grep -q AutoLoginUser "$REGSAVE.new"; then
+		chmod 600 "$REGSAVE.new"
+		mv -f "$REGSAVE.new" "$REGSAVE"
+	else
+		rm -f "$REGSAVE.new"
+	fi
+
+	# 1. The display session, and with it Steam and any game.
+	systemctl stop $DM 2>> "$LOG"
+	for _ in $(seq 40); do
+		steam_running || break
+		sleep 1
+	done
+	for u in $BC250_STOP_UNITS; do
+		systemctl is-active -q "$u" && STOPPED="$STOPPED $u"
+	done
+	for u in $BC250_STOP_USER_UNITS; do
+		systemctl --user -M "$BC250_USER@" is-active -q "$u" 2> /dev/null && USER_STOPPED="$USER_STOPPED $u"
+	done
+	# shellcheck disable=SC2086
+	[ -z "$STOPPED" ] || systemctl stop $STOPPED 2>> "$LOG"
+	# shellcheck disable=SC2086
+	[ -z "$USER_STOPPED" ] || systemctl --user -M "$BC250_USER@" stop $USER_STOPPED 2>> "$LOG"
+fi
+
+# 2. The chip's table of blocks, for a start of the driver after a sleep (the old way needs it).
+mkdir -p "$VAR/fw/amdgpu"
+DISC=/sys/kernel/debug/dri/$CARD/amdgpu_discovery
+if [ -r "$DISC" ]; then
+	cat "$DISC" > "$VAR/fw/amdgpu/ip_discovery.bin.new" 2>> "$LOG" && [ -s "$VAR/fw/amdgpu/ip_discovery.bin.new" ] &&
+		mv -f "$VAR/fw/amdgpu/ip_discovery.bin.new" "$VAR/fw/amdgpu/ip_discovery.bin"
+fi
+if [ "$KEEP" = 0 ]; then
+	if [ ! -s "$VAR/fw/amdgpu/ip_discovery.bin" ]; then
+		log "no copy of the chip's table: not sleeping"
+		bring_back
+		exit 1
+	fi
+
+	# 3. The driver off the card: whoever still holds the card goes first, then the sound function, then the card.
+	for p in $(holders); do kill "$p" 2> /dev/null; done
+	sleep 2
+	for p in $(holders); do kill -9 "$p" 2> /dev/null; done
+	[ -e "/sys/bus/pci/devices/$AUDIO/driver" ] && echo "$AUDIO" > "/sys/bus/pci/devices/$AUDIO/driver/unbind" 2>> "$LOG"
+	if ! timeout 60 sh -c "echo $CARD > /sys/bus/pci/drivers/amdgpu/unbind" 2>> "$LOG" || [ -e "/sys/bus/pci/devices/$CARD/driver" ]; then
+		log "the driver did not come off the card: not sleeping"
+		bring_back
+		exit 1
+	fi
+fi
+
+# 4. What may wake the board.
+usb_wake
+
+# 5. Devices resumed one by one, and the HPET not used as a clock (it reads all ones after a sleep here).
+PM_ASYNC=$(cat /sys/power/pm_async)
+echo 0 > /sys/power/pm_async
+echo hpet > /sys/devices/system/clocksource/clocksource0/unbind_clocksource 2> /dev/null
+
+# 6. The unlocked cores, which the firmware does not start again.
+for c in $SPARE; do
+	[ "$(cat "/sys/devices/system/cpu/cpu$c/online" 2> /dev/null)" = 1 ] && echo 0 > "/sys/devices/system/cpu/cpu$c/online" 2>> "$LOG"
+done
+
+# For tests: the clock wakes the board.
+if [ -s "$RUN/alarm" ]; then
+	ALARM=$(tr -cd '0-9' < "$RUN/alarm")
+	rm -f "$RUN/alarm"
+	echo 0 > /sys/class/rtc/rtc0/wakealarm 2> /dev/null
+	[ -z "$ALARM" ] || { rtcwake -m no -s "$ALARM" > /dev/null 2>&1 && log "test alarm in $ALARM s"; }
+fi
+# What runs right after the wake-up is in memory before the sleep.
+echo "bc250-sleep: mark for the kernel log" > /dev/kmsg
+cat "$DIR/wdt.py" > /dev/null
+python3 -c 'import fcntl, struct, os, sys' 2> /dev/null
+sync
+MEM_SLEEP=$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/power/mem_sleep)
+echo deep > /sys/power/mem_sleep
+log "entering S3 after $(($(date +%s) - T0)) s of preparation, threads $(cat /sys/devices/system/cpu/online)"
+sync
+T1=$(date +%s)
+echo mem > /sys/power/state
+RC=$?
+
+# ---- awake again ----
+echo "$PM_ASYNC" > /sys/power/pm_async
+[ -z "$MEM_SLEEP" ] || echo "$MEM_SLEEP" > /sys/power/mem_sleep
+STATUS=0
+if [ "$RC" != 0 ]; then
+	STATUS=1
+	# The kernel did not go to sleep: the cores still have their power and come back.
+	for c in $SPARE; do
+		echo 1 > "/sys/devices/system/cpu/cpu$c/online" 2>> "$LOG"
+	done
+	log "the kernel did not enter S3 (rc $RC): cores back, threads $(cat /sys/devices/system/cpu/online)"
+fi
+disk_fix
+log "awake: rc=$RC, asleep for $(($(date +%s) - T1)) s; $(dmesg | grep 'bc250_pm: southbridge bytes' | tail -1 | sed 's/.*bc250_pm: //' | cut -c1-200)"
+# The module started the southbridge's watchdog on the way back, against a wake-up that hangs after the
+# kernel is back: it is stopped now that the system is.
+python3 "$DIR/wdt.py" stop >> "$LOG" 2>&1 || log "the watchdog was not stopped"
+
+if [ "$KEEP" = 1 ]; then
+	kick
+	restart_units
+	driver_check
+	log "done: the driver stayed on the card, session $(systemctl is-active $DM), threads $(cat /sys/devices/system/cpu/online)"
+	exit "$STATUS"
+fi
+bring_back
+
+# SteamOS answers display sessions that keep ending by setting Steam back to its first start: the login is
+# then gone from the registry, and the copy taken before the sleep goes back with Steam stopped.
+sleep 20
+if ! grep -q AutoLoginUser "$REG" 2> /dev/null && grep -q AutoLoginUser "$REGSAVE" 2> /dev/null; then
+	systemctl stop $DM 2>> "$LOG"
+	for _ in $(seq 40); do
+		steam_running || break
+		sleep 1
+	done
+	# Written as the user, for the same reason.
+	# shellcheck disable=SC2016
+	runuser -u "$BC250_USER" -- sh -c 'mkdir -p "$(dirname "$1")" && cat > "$1"' _ "$REG" < "$REGSAVE" 2>> "$LOG"
+	systemctl start $DM 2>> "$LOG"
+	log "Steam had been set back to its first start: the saved registry is in place again"
+fi
+log "done: session $(systemctl is-active $DM), threads $(cat /sys/devices/system/cpu/online)"
+exit "$STATUS"

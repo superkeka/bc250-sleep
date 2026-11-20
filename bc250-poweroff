@@ -1,0 +1,73 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Power the board off so that a USB device, such as the gamepad, can switch it on again.
+#
+# systemd-poweroff.service runs this at the very end of a shutdown: services are stopped, file systems are
+# unmounted. A plain power-off leaves the USB controllers halted, and nothing on USB can wake the board.
+# The kernel's hibernation power-off arms them the way a sleep does, so this takes that path: it writes a
+# hibernation image nobody will read (into a zram device, that is into memory: nothing goes to the disk) and
+# lets the kernel enter S4. The next start is an ordinary cold boot.
+#
+# Installed by "bc250-sleep shutdown wake" (systemd/systemd-poweroff.conf). Whatever fails here, the script
+# returns, and systemd powers the board off the usual way.
+set -u
+DIR=/etc/bc250-sleep
+LOG=/var/lib/bc250-sleep/poweroff.log
+log() {
+	echo "$(date '+%F %T') $*" >> "$LOG" 2> /dev/null
+	echo "bc250-poweroff: $*" > /dev/kmsg 2> /dev/null
+}
+: > "$LOG" 2> /dev/null
+
+# The helper module enables the wake event the southbridge really raises for USB (gpe=11). It is normally
+# loaded by the boot check; after a kernel update it is built again.
+if ! grep -q '^bc250_pm ' /proc/modules; then
+	if ! insmod "$DIR/src/bc250_pm.ko" gpe=11 2>> "$LOG"; then
+		log "building the module for $(uname -r)"
+		timeout 120 "$DIR/bc250-update" build >> "$LOG" 2>&1
+		insmod "$DIR/src/bc250_pm.ko" gpe=11 2>> "$LOG" || { log "no module: plain power-off"; exit 0; }
+	fi
+fi
+
+# Every USB controller and every USB device that can ask for a wake-up.
+for d in /sys/bus/pci/devices/*; do
+	case "$(cat "$d/class" 2> /dev/null)" in
+	0x0c03*) echo enabled > "$d/power/wakeup" 2> /dev/null ;;
+	esac
+done
+for w in /sys/bus/usb/devices/*/power/wakeup; do
+	echo enabled > "$w" 2> /dev/null
+done
+
+# The image needs a swap device. At this point the system's own swap is off: take a zram device.
+ZRAM=""
+SWAP=$(awk 'NR > 1 && $2 == "partition" { print $1; exit }' /proc/swaps)
+if [ -z "$SWAP" ]; then
+	modprobe zram 2> /dev/null
+	ZRAM=$(zramctl --find --size 2G 2>> "$LOG") || { log "no zram device: plain power-off"; exit 0; }
+	if ! mkswap "$ZRAM" > /dev/null 2>> "$LOG" || ! swapon "$ZRAM" 2>> "$LOG"; then
+		log "no swap on $ZRAM: plain power-off"
+		exit 0
+	fi
+	SWAP=$ZRAM
+fi
+NUMBER=$(lsblk -dno MAJ:MIN "$SWAP" 2> /dev/null | tr -d '[:space:]')
+give_up() {
+	log "$1: plain power-off"
+	[ -z "$ZRAM" ] || swapoff "$ZRAM" 2> /dev/null
+	exit 0
+}
+[ -n "$NUMBER" ] || give_up "no device number for $SWAP"
+echo 0 > /sys/power/resume_offset 2> /dev/null
+echo "$NUMBER" > /sys/power/resume 2>> "$LOG" || give_up "the kernel did not take $NUMBER as the image device"
+echo 0 > /sys/power/image_size
+echo platform > /sys/power/disk 2>> "$LOG" || give_up "no platform mode for hibernation"
+
+# The image holds every page in use, and most of what is in use at this point is the file cache. Without
+# it there is little left to pack, and the step takes seconds instead of half a minute.
+sync
+echo 3 > /proc/sys/vm/drop_caches 2> /dev/null
+log "powering off through the hibernation path, image on $SWAP ($NUMBER), $(awk '/^MemAvailable|^Cached:|^AnonPages/ { printf "%s %d MiB ", $1, $2 / 1024 }' /proc/meminfo)"
+sync
+echo disk > /sys/power/state 2>> "$LOG"
+give_up "the hibernation path returned"

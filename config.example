@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Settings of bc250-sleep for this board, read by /etc/bc250-sleep/bc250-sleep (a shell file).
+# install.sh puts this file in place as /etc/bc250-sleep/config once; later installs leave that copy alone.
+
+# The user of the display session: "auto" takes the one logged in on seat0, else the first user (uid 1000).
+BC250_USER=auto
+
+# Threads of the cores the firmware does not start again after S3, which go offline before it. With the
+# 8-core unlock these are the two cores beyond the firmware's six: "auto" takes 6 7 14 15 when 16 threads
+# are online and none otherwise. Give the numbers yourself if your unlock adds other cores.
+BC250_SPARE_CPUS=auto
+
+# Services that talk to the graphics card or to the SMU. They are stopped only when the GPU driver has to
+# come off the card for a sleep (when gfxcsb cannot be used on the running kernel), and started after it.
+BC250_STOP_UNITS="cyan-skillfish-governor-smu.service bc250-cu-live-manager.service bc250-smu-oc.service coolercontrold.service"
+BC250_STOP_USER_UNITS=""
+
+# System services restarted after every wake-up, when they are enabled: ones that redo what a sleep undoes
+# (for example a service that enables more compute units than the chip starts with).
+BC250_RESTART_UNITS="bc250-cu-live-manager.service"

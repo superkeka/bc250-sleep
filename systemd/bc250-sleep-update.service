@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# After a SteamOS update: the compiler and the kernel's build files installed again, the modules built for the
+# new kernel, the S3 table put back. Nothing to do on an ordinary boot. Type=exec, so that the boot does not
+# wait for a download.
+[Unit]
+Description=BC-250 sleep: modules for the running kernel
+Wants=network-online.target
+After=network-online.target bc250-sleep-boot.service
+
+[Service]
+Type=exec
+ExecStart=/etc/bc250-sleep/bc250-update
+
+[Install]
+WantedBy=multi-user.target

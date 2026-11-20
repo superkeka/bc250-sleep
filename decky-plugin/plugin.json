@@ -1,0 +1,10 @@
+{
+  "name": "BC-250 Sleep",
+  "author": "superkeka",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["root", "power"],
+    "description": "A real sleep for the AMD BC-250: hibernation or S3 behind Steam's Sleep, and a power-off the gamepad can undo."
+  }
+}
