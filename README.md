@@ -1,8 +1,8 @@
 # bc250-sleep
 
 A real sleep for the **AMD BC-250** running SteamOS, Bazzite or CachyOS: Steam's **Sleep** puts the board
-into hibernation or into ACPI S3 instead of a sleep it never comes back from, and the display session, Steam
-and a running game are there again after the wake-up. After **Power Off** the gamepad switches the board on.
+into hibernation or into ACPI S3. **Power Off** is replaced with a hibernation that saves no state, so the
+gamepad can switch the board on.
 
 > [!WARNING]
 > Works and is tested only on SteamOS with the CPU unlock done in the BIOS. Use at your own risk.
