@@ -31,9 +31,6 @@ About 5 W at the plug. The board powers off through the hibernation path, so USB
 gamepad switches the board on; every start is a fresh boot. Only from a blue USB 3.0 port, not over
 Bluetooth.
 
-A month in each state costs its watts times 0.73 kWh (730 hours): S3 about 7.3 kWh, the hibernation about
-4 kWh, powered off about 3.6 kWh.
-
 ## Requirements
 
 - AMD BC-250 with a P3.00-based BIOS: the stock P3.00 or a modded one built on it (it still reports
