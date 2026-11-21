@@ -98,6 +98,7 @@ Settings go into `/etc/bc250-sleep/config` (installed from `config.example` once
 ## Documentation
 
 - [How it works](docs/how-it-works.md): why each step is there.
+- [Unlocked cores after S3](docs/s3-cores.md): what was tried to bring them back, and what might help.
 
 ## For developers
 
@@ -114,6 +115,15 @@ SteamOS is what it is tested on; on Bazzite and CachyOS the build of the modules
 checked, a sleep there is not yet. Other systems: whatever compiler and build files are installed are used,
 and the S3 table and the kernel parameters are left to you (`bc250-update check` says what is missing).
 On a system with SELinux (Bazzite) the scripts and modules get the labels systemd and the kernel need.
+
+### Unlocked cores after S3
+
+After S3 the firmware starts only its own six cores; the extra two (CPUs 6, 7, 14, 15) stay offline until a
+reboot. Even the unlock in the BIOS (DXE) does not bring them back: DXE does not run on the way back from S3,
+and redoing the unlock there with a reset hangs the firmware.
+
+Help wanted: [docs/s3-cores.md](docs/s3-cores.md) has what was tried, with the registers and results, and
+what might help.
 
 ### Layout
 
