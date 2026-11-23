@@ -1,6 +1,6 @@
 {
   "name": "bc250-sleep-decky",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "bc250-sleep from Game Mode: install it and pick what Sleep and Power Off do",
   "type": "module",
   "scripts": {

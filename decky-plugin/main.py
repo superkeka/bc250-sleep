@@ -9,6 +9,7 @@ import shutil
 import ssl
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -23,6 +24,7 @@ UPDATE = os.path.join(DIR, "bc250-update")
 # The uninstall leaves the folder (with the config) behind: installed means the boot check is in place.
 UNIT = "/etc/systemd/system/bc250-sleep-boot.service"
 LOG = "/var/lib/bc250-sleep/sleep.log"
+JOBS = "/run/bc250-sleep-plugin"
 SLEEPS = ("hibernate", "s3")
 SHUTDOWNS = ("default", "wake")
 
@@ -56,6 +58,38 @@ def _run(*cmd, timeout=600):
     out = (p.stdout + p.stderr).strip()
     decky.logger.info("%s -> %d %s", " ".join(cmd), p.returncode, out[-800:])
     return p.returncode, out
+
+
+def _service(name, *cmd, timeout=900):
+    """Runs cmd as a transient systemd service and waits for it. systemd owns it, not the plugin: Decky
+    reloads the plugin right after installing a new version and kills it after 5 s, which would otherwise
+    stop an install half way. A call while the same service runs waits for that run instead of starting
+    another."""
+    unit = "bc250-sleep-plugin-%s.service" % name
+    out_file = os.path.join(JOBS, name + ".log")
+    rc_file = os.path.join(JOBS, name + ".rc")
+    if _run("systemctl", "is-active", "--quiet", unit, timeout=30)[0] != 0:
+        os.makedirs(JOBS, exist_ok=True)
+        for f in (out_file, rc_file):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+        code, out = _run("systemd-run", "--unit=" + unit, "--collect", "--quiet", "/bin/sh", "-c",
+                         'rc=0; "$@" > "%s" 2>&1 || rc=$?; echo "$rc" > "%s"' % (out_file, rc_file),
+                         "sh", *cmd, timeout=30)
+        if code != 0:
+            return code, out
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(rc_file):
+        if time.monotonic() > deadline:
+            return 1, "%s did not finish in %d s" % (unit, timeout)
+        time.sleep(1)
+    out = _read(out_file)
+    rc = _read(rc_file)
+    code = int(rc) if rc.isdigit() else 1
+    decky.logger.info("%s -> %d %s", " ".join(cmd), code, out[-800:])
+    return code, out
 
 
 def _ssl_context():
@@ -191,17 +225,17 @@ class Plugin:
 
     async def install(self):
         script = os.path.join(PACKAGE, "install.sh")
-        code, out = await asyncio.to_thread(_run, "bash", script, timeout=900)
+        code, out = await asyncio.to_thread(_service, "install", "bash", script, timeout=900)
         return {"ok": code == 0, "log": out[-1500:]}
 
     async def rebuild(self):
         """After a system update: the compiler and the kernel's build files, the modules for the running kernel."""
-        code, out = await asyncio.to_thread(_run, UPDATE, timeout=900)
+        code, out = await asyncio.to_thread(_service, "rebuild", UPDATE, timeout=900)
         return {"ok": code == 0, "log": out[-1500:]}
 
     async def uninstall(self):
         script = os.path.join(PACKAGE, "install.sh")
-        code, out = await asyncio.to_thread(_run, "bash", script, "--uninstall", timeout=300)
+        code, out = await asyncio.to_thread(_service, "uninstall", "bash", script, "--uninstall", timeout=300)
         return {"ok": code == 0, "log": out[-1500:]}
 
     async def reboot(self):

@@ -69,6 +69,8 @@ async function updatePlugin(release: Release, installed: boolean) {
       try {
         if ((await getState()).bundled === release.version) {
           if (installed) {
+            // Decky reloads the new version once more about a second after it first answers.
+            await new Promise((r) => setTimeout(r, 3000));
             const r = await install();
             toast(r.ok ? `Updated to ${release.version}` : r.log || "the package did not update");
           } else {
