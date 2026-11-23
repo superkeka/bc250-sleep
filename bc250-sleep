@@ -86,6 +86,15 @@ log() {
 	echo "$(date '+%F %T') $*" >> "$LOG" 2> /dev/null
 	echo "bc250-sleep: $*" > /dev/kmsg 2> /dev/null
 }
+# Steam's Sleep reaches this script through suspend.target and sleep.target. Guides for this board have them
+# masked, because a sleep without this package hangs it: the button then does nothing at all.
+sleep_masked() {
+	local t out=""
+	for t in sleep.target suspend.target; do
+		[ "$(systemctl is-enabled "$t" 2> /dev/null)" = masked ] && out="$out $t"
+	done
+	echo "${out# }"
+}
 shutdown_mode() {
 	if [ -e "$POWEROFF_DROPIN" ]; then echo wake; else echo default; fi
 }
@@ -218,6 +227,8 @@ status)
 		if [ -e "$RUN/keep" ]; then echo "S3 sleep: ready, the session goes through it"; else echo "S3 sleep: ready, the old way (the session is closed for it)"; fi
 	else echo "S3 sleep: off: $(cat "$RUN/why" 2> /dev/null || echo 'the boot check has not run')"
 	fi
+	masked=$(sleep_masked)
+	[ -z "$masked" ] || echo "the Sleep button: does not get here: $masked masked (systemctl unmask $masked)"
 	exit 0
 	;;
 mode)
