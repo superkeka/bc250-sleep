@@ -5,7 +5,7 @@ into hibernation or into ACPI S3. **Power Off** is replaced with a hibernation t
 gamepad can switch the board on.
 
 > [!WARNING]
-> Works and is tested only on SteamOS with the CPU unlock done in the BIOS. Use at your own risk.
+> Tested only on SteamOS with the CPU unlock done in the BIOS. Use at your own risk.
 
 The easiest way to install it is the Decky plugin.
 
