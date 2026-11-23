@@ -19,6 +19,7 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/suspend.h>
+#include <linux/uaccess.h>
 
 static unsigned long off;
 module_param(off, ulong, 0444);
@@ -29,7 +30,32 @@ MODULE_PARM_DESC(clear, "clear the flag at load and before every sleep");
 
 static struct pci_dev *card;
 
-/* The driver's device structure starts 0x10 before its DRM device, which is the card's driver data. */
+/*
+ * The card's driver data is the DRM device inside the driver's device structure. That structure starts with
+ * the card's struct device and the card itself; how many pointers lie between those two and the DRM device
+ * differs between kernels (none upstream and on SteamOS, two on CachyOS's deckify kernel). So the start is
+ * looked for, from the nearest place back: the first one that holds those two. Anything else, and the
+ * layout is not one this module knows.
+ */
+#define ADEV_BACK_MIN (2 * sizeof(void *))
+#define ADEV_BACK_MAX (8 * sizeof(void *))
+
+static void *adev_of(void *ddev)
+{
+	void *adev, *first, *second;
+	size_t back;
+
+	for (back = ADEV_BACK_MIN; back <= ADEV_BACK_MAX; back += sizeof(void *)) {
+		adev = ddev - back;
+		if (get_kernel_nofault(first, (void **)adev) ||
+		    get_kernel_nofault(second, (void **)(adev + sizeof(void *))))
+			return NULL;
+		if (first == &card->dev && second == card)
+			return adev;
+	}
+	return NULL;
+}
+
 static u8 *flag_at(void)
 {
 	void *ddev, *adev;
@@ -39,9 +65,8 @@ static u8 *flag_at(void)
 	ddev = pci_get_drvdata(card);
 	if (!ddev)
 		return NULL;
-	adev = ddev - 0x10;
-	/* Its second field is the card itself: anything else, and the layout is not the one expected. */
-	if (*(struct pci_dev **)(adev + 8) != card)
+	adev = adev_of(ddev);
+	if (!adev)
 		return NULL;
 	return adev + off;
 }
@@ -56,7 +81,7 @@ static int flag_get(char *buffer, const struct kernel_param *kp)
 		return -ENODEV;
 	device_lock(&card->dev);
 	f = flag_at();
-	ret = f ? sysfs_emit(buffer, "%u\n", *f) : sysfs_emit(buffer, "no driver on the card\n");
+	ret = f ? sysfs_emit(buffer, "%u\n", *f) : sysfs_emit(buffer, "no driver on the card, or not its layout\n");
 	device_unlock(&card->dev);
 	return ret;
 }
@@ -72,7 +97,7 @@ static void do_clear(const char *when)
 	device_lock(&card->dev);
 	f = flag_at();
 	if (!f)
-		pr_info("gfxcsb: %s: no driver on the card\n", when);
+		pr_info("gfxcsb: %s: no driver on the card, or not its layout\n", when);
 	else if (*f > 1)
 		pr_warn("gfxcsb: %s: the byte holds %u, not a flag: left alone\n", when, *f);
 	else {
