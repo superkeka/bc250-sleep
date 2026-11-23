@@ -54,7 +54,7 @@ BC250_USER=auto
 BC250_SPARE_CPUS=auto
 BC250_STOP_UNITS="cyan-skillfish-governor-smu.service bc250-cu-live-manager.service bc250-smu-oc.service coolercontrold.service"
 BC250_STOP_USER_UNITS=""
-BC250_RESTART_UNITS="bc250-cu-live-manager.service"
+BC250_RESTART_UNITS="bc250-cu-live-manager.service bc250-smu-oc.service"
 # shellcheck source=/dev/null
 [ -r "$DIR/config" ] && . "$DIR/config"
 # shellcheck source=tools/system.sh
