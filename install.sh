@@ -67,9 +67,11 @@ sys_label "$DIR/bc250-sleep" "$DIR/bc250-poweroff" "$DIR/bc250-update" "$DIR/"*.
 install -m 644 "$HERE/systemd/systemd-poweroff.conf" "$HERE/VERSION" "$DIR/"
 [ -e "$DIR/config" ] || install -m 644 "$HERE/config.example" "$DIR/config"
 # The sleep and the power-off are the user's choice once made; a first install takes S3 and the power-off
-# the gamepad undoes.
+# the gamepad undoes. First means the boot check is not in place yet, so an install that failed half way
+# counts as first again.
 FIRST=""
-[ -e "$DIR/mode" ] || { FIRST=1; echo s3 > "$DIR/mode"; }
+[ -e "$UNIT" ] || FIRST=1
+[ -e "$DIR/mode" ] || echo s3 > "$DIR/mode"
 
 # The compiler and the kernel's build files, when they are missing: pacman (SteamOS has neither), or a
 # container with the compiler (Bazzite has the build files in its image). bc250-update installs them again

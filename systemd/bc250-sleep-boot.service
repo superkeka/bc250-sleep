@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 [Unit]
 Description=BC-250 sleep: what this boot can do
-After=local-fs.target
+After=local-fs.target swap.target
 
 [Service]
 Type=oneshot
