@@ -26,7 +26,8 @@ back. Each step below adds one missing piece.
   On this board the block loses power in S3, so after the wake-up the ring test fails. The module clears the
   driver's "submitted" flag before every sleep; the offset of the flag is read out of the driver's code for
   the running kernel (`tools/gfxcsb-offset.sh`). The upstream driver (Bazzite, CachyOS) has no such flag
-  and submits the clear state on every start, so there the module is not needed. If the code is neither,
+  and submits the clear state on every start, so there the module is not needed. CachyOS's deckify kernel
+  carries SteamOS's flag, so there it is. If the code is neither,
   the old way is taken: the display session is closed and the driver comes off the card for the sleep.
 - **The display clock** (`kick`). The first change of the display clock dividers after a sleep is not applied
   (a 4K picture stays flat green) unless the register is written once with its own value.
