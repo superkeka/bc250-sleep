@@ -122,4 +122,9 @@ fi
 # The check for this boot, so that the answer is known now.
 "$DIR/bc250-sleep" boot
 "$DIR/bc250-sleep" status
+# Left to the user: whoever masked them had a reason before this package was there.
+for t in sleep.target suspend.target; do
+	[ "$(systemctl is-enabled "$t" 2> /dev/null)" != masked ] ||
+		echo "note: $t is masked, so Steam's Sleep does not reach bc250-sleep: sudo systemctl unmask $t"
+done
 echo "installed: Steam's Sleep takes the sleep named in the first line above; log: $VAR/sleep.log"

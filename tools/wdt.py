@@ -7,6 +7,7 @@ A reset by the watchdog keeps standby power, so the BIOS setup survives it (a po
 usage (root): wdt.py <seconds>
               wdt.py stop        stop a running watchdog, whoever started it
 """
+import errno
 import fcntl
 import os
 import struct
@@ -16,7 +17,16 @@ WDIOC_SETTIMEOUT = 0xC0045706
 
 if len(sys.argv) != 2 or not (sys.argv[1] == 'stop' or sys.argv[1].isdigit()):
     sys.exit(__doc__.strip())
-fd = os.open('/dev/watchdog', os.O_WRONLY)
+try:
+    fd = os.open('/dev/watchdog', os.O_WRONLY)
+except OSError as e:
+    # One program at a time can have the watchdog. Where another has it (systemd with RuntimeWatchdogSec, a
+    # watchdog daemon), that one feeds the timer the module started on the way back, and stops feeding it if
+    # the system hangs: there is nothing to stop here.
+    if e.errno == errno.EBUSY and sys.argv[1] == 'stop':
+        print('wdt: another program has the watchdog and feeds it: left running')
+        sys.exit(0)
+    raise
 if sys.argv[1] == 'stop':
     # Opening starts the driver's own count; its closing byte then stops the timer for good.
     os.write(fd, b'V')

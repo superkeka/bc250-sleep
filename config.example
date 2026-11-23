@@ -16,5 +16,6 @@ BC250_STOP_UNITS="cyan-skillfish-governor-smu.service bc250-cu-live-manager.serv
 BC250_STOP_USER_UNITS=""
 
 # System services restarted after every wake-up, when they are enabled: ones that redo what a sleep undoes
-# (for example a service that enables more compute units than the chip starts with).
-BC250_RESTART_UNITS="bc250-cu-live-manager.service"
+# (for example a service that enables more compute units than the chip starts with, or one that sets the
+# CPU's clock and voltage through the SMU: the firmware starts the cores at its own values after S3).
+BC250_RESTART_UNITS="bc250-cu-live-manager.service bc250-smu-oc.service"
