@@ -20,6 +20,8 @@ PACKAGE = os.path.join(decky.DECKY_PLUGIN_DIR, "package")
 DIR = "/etc/bc250-sleep"
 TOOL = os.path.join(DIR, "bc250-sleep")
 UPDATE = os.path.join(DIR, "bc250-update")
+# The uninstall leaves the folder (with the config) behind: installed means the boot check is in place.
+UNIT = "/etc/systemd/system/bc250-sleep-boot.service"
 LOG = "/var/lib/bc250-sleep/sleep.log"
 SLEEPS = ("hibernate", "s3")
 SHUTDOWNS = ("default", "wake")
@@ -33,9 +35,21 @@ def _read(path):
         return ""
 
 
+def _env():
+    # Decky is a PyInstaller bundle: its LD_LIBRARY_PATH points at its own copies of libzstd, libz and others,
+    # which break the system's tools (zstd: "undefined symbol: POOL_free"). The tools get the system's own.
+    env = dict(os.environ)
+    orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if orig:
+        env["LD_LIBRARY_PATH"] = orig
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
 def _run(*cmd, timeout=600):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_env())
     except (OSError, subprocess.TimeoutExpired) as e:
         decky.logger.error("%s: %s", " ".join(cmd), e)
         return 1, str(e)
@@ -93,7 +107,7 @@ class Plugin:
 
     async def get_state(self):
         board = _read("/sys/class/dmi/id/board_name") == "AMD BC-250"
-        installed = os.access(TOOL, os.X_OK)
+        installed = os.access(TOOL, os.X_OK) and os.path.exists(UNIT)
         state = {
             "board": board,
             "bios": _read("/sys/class/dmi/id/bios_version"),
@@ -155,7 +169,7 @@ class Plugin:
                 os.rename(dst + ".new", dst)
                 shutil.rmtree(old, ignore_errors=True)
             # Decky loads the new version on its restart; this process goes with it.
-            subprocess.Popen(["sh", "-c", "sleep 2; systemctl restart plugin_loader"], start_new_session=True)
+            subprocess.Popen(["sh", "-c", "sleep 2; systemctl restart plugin_loader"], start_new_session=True, env=_env())
             return {"ok": True}
         try:
             return await asyncio.to_thread(work)

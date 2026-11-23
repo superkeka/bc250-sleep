@@ -36,10 +36,10 @@ Bluetooth.
 - AMD BC-250 with a P3.00-based BIOS: the stock P3.00 or a modded one built on it (it still reports
   P3.00). On other versions the BIOS option for S3 is not written, so only the hibernation works.
 - SteamOS, Bazzite or CachyOS, and the network: the modules are built on the board for its kernel.
+- For S3 on a board with the 8-core unlock: the kernel parameter `nvme.poll_queues=1`. The install adds it
+  and the uninstall takes it out again; it counts from the next reboot.
 - A swap file or partition for the hibernation (SteamOS has one; Bazzite and CachyOS have only zram, so
   their Sleep takes S3 until one is added).
-- For S3 on a board with the 8-core unlock: the kernel parameter `nvme.poll_queues=1`
-  (`sudo /etc/bc250-sleep/nvme-param.sh add`, then a reboot).
 
 ## Install
 

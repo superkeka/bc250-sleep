@@ -147,7 +147,11 @@ boot_check() {
 	grep -q deep /sys/power/mem_sleep || why="$why; this boot's ACPI tables offer no S3"
 	# With cores that do not come back the disk's queues need one polled queue (nvme-param.sh).
 	if [ -n "$SPARE" ] && ! grep -qw 'nvme.poll_queues=1' /proc/cmdline; then
-		why="$why; kernel parameter nvme.poll_queues=1 is missing (nvme-param.sh add, then a reboot)"
+		if sys_karg_configured s3-nvme nvme.poll_queues=1; then
+			why="$why; kernel parameter nvme.poll_queues=1 counts from the next reboot"
+		else
+			why="$why; kernel parameter nvme.poll_queues=1 is missing (nvme-param.sh add, then a reboot)"
+		fi
 	fi
 	# The BIOS option the firmware needs to come back from S3: "CPU DC BTC" on, at 690 mV (AmdSetup bytes
 	# 0x6f6-0x6f8; at its default, Auto, a wake-up hangs in the firmware). The firmware reads it when it boots,

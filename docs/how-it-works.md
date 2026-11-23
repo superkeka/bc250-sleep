@@ -18,8 +18,10 @@ back. Each step below adds one missing piece.
 - **Unlocked cores** (`BC250_SPARE_CPUS`). The BC-250's APU has eight cores, of which the firmware enables
   six; a separate modification (the "8-core unlock", not part of this package) unmasks the other two from
   the running system. After S3 the firmware starts only its six, so the others are taken offline before
-  the sleep. The disk then needs `nvme.poll_queues=1`: with it the block layer rebuilds its queue maps for
-  the threads that are left.
+  the sleep. The disk then needs one polled queue (`nvme.poll_queues=1`): with it the block layer rebuilds
+  its queue maps for the threads that are left. It has to be a kernel parameter: the driver sets up its
+  queue maps when it finds the disk, and a polled queue added later with a reset of the controller does not
+  get one.
 - **The GPU driver** (`gfxcsb`). On an APU SteamOS's amdgpu submits the gfx block's clear state only once.
   On this board the block loses power in S3, so after the wake-up the ring test fails. The module clears the
   driver's "submitted" flag before every sleep; the offset of the flag is read out of the driver's code for

@@ -36,12 +36,12 @@ if [ "${1:-}" = --uninstall ]; then
 		"$DIR/bc250-update" acpi remove || echo "the S3 table could not be taken out of the ACPI archive"
 	fi
 	rm -f "$UNIT" "$UPDATE_UNIT" "$DROPIN" "$POWEROFF_DROPIN" "$KEEP"
+	[ ! -x "$DIR/nvme-param.sh" ] || "$DIR/nvme-param.sh" remove > /dev/null || echo "nvme.poll_queues=1 could not be removed"
 	unload
 	systemctl daemon-reload
 	echo "removed. Left in place, to take out by hand if wanted:"
 	echo "  $DIR (with your config) and $VAR (the log)"
 	echo "  the BIOS option CPU DC BTC (BIOS setup, or: sudo python3 $DIR/setvar.py 0x6f6=0xf 0x6f7=0 0x6f8=0)"
-	echo "  the kernel parameter nvme.poll_queues=1: sudo $DIR/nvme-param.sh remove"
 	case "$SYS" in
 	steamos | pacman) echo "  the compiler and the kernel's build files (pacman; a SteamOS update takes them out anyway)" ;;
 	ostree) echo "  the container image $BUILD_IMAGE (podman rmi $BUILD_IMAGE)" ;;
@@ -50,9 +50,6 @@ if [ "${1:-}" = --uninstall ]; then
 fi
 
 [ "$(cat /sys/class/dmi/id/board_name 2> /dev/null)" = "AMD BC-250" ] || { echo "this is not an AMD BC-250"; exit 1; }
-[ "$(nproc --all)" != 16 ] || grep -qw 'nvme.poll_queues=1' /proc/cmdline ||
-	echo "note: kernel parameter nvme.poll_queues=1 is not set: the S3 sleep stays off until it is" \
-		"(sudo $DIR/nvme-param.sh add, then a reboot)"
 
 install -d -m 755 "$DIR" "$DIR/src" "$DIR/gfxcsb" "$DIR/tmp" "$VAR"
 # Files of earlier versions that this one no longer has.
@@ -95,6 +92,12 @@ fi
 
 # Without the table only the hibernation works; the status says why.
 "$DIR/bc250-update" acpi add || echo "note: the S3 table is not in the boot: S3 stays off until it is"
+# With the 8-core unlock S3 needs one polled disk queue (nvme-param.sh); it counts from the next boot.
+if [ "$(nproc --all)" = 16 ] && ! grep -qw 'nvme.poll_queues=1' /proc/cmdline &&
+	! sys_karg_configured s3-nvme nvme.poll_queues=1; then
+	"$DIR/nvme-param.sh" add ||
+		echo "note: kernel parameter nvme.poll_queues=1 not set: S3 stays off until it is ($DIR/nvme-param.sh add)"
+fi
 
 install -m 644 "$HERE/systemd/bc250-sleep-boot.service" "$UNIT"
 install -m 644 "$HERE/systemd/bc250-sleep-update.service" "$UPDATE_UNIT"
